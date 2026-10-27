@@ -82,30 +82,6 @@ additional_life_expectancy <- function(data, grouped = TRUE, reference_age = 45,
     tertile_cuts=cuts,participants=nrow(d),first_CB_or_death=sum(d$CB_free_event))
 }
 
-# Population attributable fraction ----
-# paf <- additional_paf(data)
-additional_paf <- function(data) {
-  d <- additional_analysis(data)
-  fit <- additional_fit(d,"exposure_tertile")
-  terms <- c("exposure_tertileT2","exposure_tertileT3")
-  b <- stats::coef(fit)[terms]; V <- stats::vcov(fit)[terms,terms,drop=FALSE]
-  hr <- exp(b); prevalence <- as.numeric(prop.table(table(d$exposure_tertile)))[2:3]
-  prevalence_cov <- (diag(prevalence)-tcrossprod(prevalence))/nrow(d)
-  rows <- lapply(list(T2=1L,T3=2L,T2_and_T3=1:2),function(index) {
-    p <- prevalence[index]; h <- hr[index]; denominator <- 1+sum(p*(h-1))
-    value <- 1-1/denominator
-    gradient_b <- p*h/denominator^2; gradient_p <- (h-1)/denominator^2
-    variance <- drop(t(gradient_b)%*%V[index,index,drop=FALSE]%*%gradient_b)+
-      drop(t(gradient_p)%*%prevalence_cov[index,index,drop=FALSE]%*%gradient_p)
-    se <- sqrt(max(0,variance))
-    data.frame(prevalence=sum(p),PAF_percent=100*value,SE_percent=100*se,
-      lower_percent=100*(value-1.96*se),upper_percent=100*(value+1.96*se))
-  })
-  results <- do.call(rbind,rows); results$contrast <- rownames(results)
-  list(results=results,HR=additional_extract(fit,terms),model=fit,PH=survival::cox.zph(fit),
-    sample=additional_counts(d),tertile_cuts=attr(d,"tertile_cuts"))
-}
-
 # Potential impact fraction ----
 # pif <- additional_pif(data)
 additional_pif <- function(data, n_grid = 180L) {
@@ -130,69 +106,53 @@ additional_pif <- function(data, n_grid = 180L) {
     sample=additional_counts(d))
 }
 
-# Generalized propensity scores ----
-# gps <- additional_gps(data)
+# GPS-based IPW and linear GPS adjustment ----
+# ps <- additional_gps(data)
+# Stabilized IPW from a normal-density GPS; cap weights without dropping participants.
 additional_gps <- function(data, seed = 20260910L) {
   d <- additional_analysis(data)
   covariates <- additional_variables()$all
   f_gps <- stats::reformulate(covariates,response="exposure")
-  f_ipw <- stats::reformulate(covariates,response="exposure_tertile")
-  set.seed(seed); ipw <- WeightIt::weightit(f_ipw,data=d,method="glm",estimand="ATE",stabilize=TRUE)
-  set.seed(seed); gps <- WeightIt::weightit(f_gps,data=d,method="glm")
-  for(w in list(ipw$weights,gps$weights))stopifnot(length(w)==nrow(d),all(is.finite(w)),all(w>0))
+  set.seed(seed); ipw <- WeightIt::weightit(f_gps,data=d,method="glm")
+  stopifnot(length(ipw$weights)==nrow(d),all(is.finite(ipw$weights)),all(ipw$weights>0))
   density_model <- stats::lm(f_gps,data=d)
   residual_sd <- stats::sigma(density_model); stopifnot(is.finite(residual_sd),residual_sd>0)
   d$GPS <- stats::dnorm(d$exposure,mean=stats::predict(density_model),sd=residual_sd)
-  propensity <- ipw$ps
-  if(is.null(propensity)) propensity <- as.numeric(prop.table(table(d$exposure_tertile))[as.character(d$exposure_tertile)])/ipw$weights
-  if(is.matrix(propensity)||is.data.frame(propensity)) {
-    propensity <- as.matrix(propensity)
-    index <- match(as.character(d$exposure_tertile),colnames(propensity)); stopifnot(!anyNA(index))
-    propensity <- propensity[cbind(seq_len(nrow(d)),index)]
-  }
-  stopifnot(length(propensity)==nrow(d),all(is.finite(propensity)),all(propensity>0&propensity<=1))
   matrix <- stats::model.matrix(stats::reformulate(covariates,intercept=FALSE),d)
   matrix <- matrix[,apply(matrix,2,function(x)length(unique(x))>1),drop=FALSE]
-  lower <- c(0,.005,.01,.025); upper <- 1-lower
-  labels <- c("No truncation","0.5-99.5 percentiles","1-99 percentiles","2.5-97.5 percentiles")
+  lower <- c(.005,.01,.025); upper <- 1-lower
+  labels <- c("0.5th-99.5th percentiles","1st-99th percentiles","2.5th-97.5th percentiles")
   results <- list(); models <- list(); balance <- list(); weights_summary <- list()
   for(i in seq_along(lower)) {
-    clipped <- lapply(list(IPW=ipw$weights,GPS=gps$weights),function(w) {
-      limits <- stats::quantile(w,c(lower[i],upper[i]),names=FALSE,type=7)
-      pmin(pmax(w,limits[1]),limits[2])
-    })
-    for(framework in names(clipped)) {
-      w <- clipped[[framework]]
-      b <- additional_balance(matrix,d$exposure,d$exposure_tertile,w,framework)
-      b$unweighted <- additional_balance(matrix,d$exposure,d$exposure_tertile,rep(1,nrow(d)),framework)$balance
-      b$scenario <- labels[i]; b$below_0.10 <- b$balance<.10
-      balance[[paste(i,framework)]] <- b
-      weights_summary[[paste(i,framework)]] <- data.frame(scenario=labels[i],framework=framework,
-        min=min(w),median=stats::median(w),max=max(w),ESS=sum(w)^2/sum(w^2),
-        ESS_percent=100*sum(w)^2/sum(w^2)/nrow(d))
-    }
-    d$analysis_weight <- clipped$GPS
+    limits <- stats::quantile(ipw$weights,c(lower[i],upper[i]),names=FALSE,type=7)
+    w <- pmin(pmax(ipw$weights,limits[1]),limits[2])
+    b <- additional_balance(matrix,d$exposure,w)
+    b$unweighted <- additional_balance(matrix,d$exposure,rep(1,nrow(d)))$balance
+    b$scenario <- labels[i]; b$below_0.10 <- b$balance<.10
+    balance[[labels[i]]] <- b
+    weights_summary[[labels[i]]] <- data.frame(scenario=labels[i],framework="IPW",
+      min=min(w),median=stats::median(w),max=max(w),ESS=sum(w)^2/sum(w^2),
+      ESS_percent=100*sum(w)^2/sum(w^2)/nrow(d))
+    d$analysis_weight <- w
     fit <- survival::coxph(additional_formula("exposure_SD"),data=d,weights=analysis_weight,
       robust=TRUE,cluster=eid,x=TRUE,y=TRUE,model=TRUE,na.action=stats::na.fail,ties="efron")
     stopifnot(fit$n==nrow(d),all(is.finite(stats::coef(fit))))
-    results[[labels[i]]] <- cbind(method="GPS-weighted Cox, 18 covariates",scenario=labels[i],
+    results[[labels[i]]] <- cbind(method="Weighted Cox proportional hazards model (weight-capped IPW)",scenario=labels[i],
       additional_extract(fit,"exposure_SD")); models[[labels[i]]] <- fit
   }
   fit <- survival::coxph(additional_formula("exposure_SD + GPS",character()),data=d,
     robust=TRUE,cluster=eid,x=TRUE,y=TRUE,model=TRUE,na.action=stats::na.fail,ties="efron")
   stopifnot(fit$n==nrow(d),all(is.finite(stats::coef(fit))))
-  results$linear_GPS <- cbind(method="Unweighted Cox with linear GPS",scenario="Not applicable",
+  results$linear_GPS <- cbind(method="Cox proportional hazards model adjusted for GPS (linear)",scenario="Not applicable",
     additional_extract(fit,"exposure_SD")); models$linear_GPS <- fit
   level <- ifelse(d$exposure<=stats::median(d$exposure),"Low","High")
   ranges <- t(vapply(split(d$GPS,level),range,numeric(2)))
   common <- c(max(ranges[,1]),min(ranges[,2]))
   support <- data.frame(eid=d$eid,GPS=d$GPS,exposure_level=level,
-    observed_treatment_probability=as.numeric(propensity),
     outside_common_support=d$GPS<common[1]|d$GPS>common[2])
   list(results=do.call(rbind,results),models=models,PH=lapply(models,survival::cox.zph),
     weights_summary=do.call(rbind,weights_summary),balance=do.call(rbind,balance),
-    propensity=list(IPW=ipw,GPS=gps),support=support,common_support=common,
-    sample=additional_counts(d),SD=attr(d,"exposure_sd"),tertile_cuts=attr(d,"tertile_cuts"))
+    support=support,common_support=common,sample=additional_counts(d),SD=attr(d,"exposure_sd"))
 }
 
 # Helper functions ----
@@ -237,13 +197,9 @@ additional_prepare <- function(data, outcome = "All_CB", impute = TRUE) {
   data <- droplevels(data[is.finite(data$exposure) & is.finite(data$time) &
     data$time > 0 & !is.na(data$event), , drop = FALSE])
   stopifnot(nrow(data) > 1L, sum(data$event) > 0)
-  tertiles <- additional_tertiles(data$exposure)
   exposure_sd <- stats::sd(data$exposure)
   stopifnot(is.finite(exposure_sd), exposure_sd > 0)
-  data$exposure_tertile <- tertiles$group
-  data$exposure_score <- as.integer(data$exposure_tertile)
   data$exposure_SD <- data$exposure / exposure_sd
-  attr(data, "tertile_cuts") <- tertiles$cuts
   attr(data, "exposure_sd") <- exposure_sd
   data
 }
@@ -298,17 +254,9 @@ additional_weighted_correlation <- function(x,y,w) {
   (sum(w*(x-mx)*(y-my))/sum(w))/sqrt(vx*vy)
 }
 
-additional_balance <- function(matrix,exposure,group,w,framework) {
+additional_balance <- function(matrix,exposure,w) {
   values <- vapply(seq_len(ncol(matrix)),function(j) {
-    x <- matrix[,j]
-    if(framework=="GPS")return(abs(additional_weighted_correlation(exposure,x,w)))
-    pairs <- utils::combn(levels(group),2)
-    max(apply(pairs,2,function(pair) {
-      a <- group==pair[1]; b <- group==pair[2]
-      difference <- sum(w[a]*x[a])/sum(w[a])-sum(w[b]*x[b])/sum(w[b])
-      denominator <- sqrt((mean((x[a]-mean(x[a]))^2)+mean((x[b]-mean(x[b]))^2))/2)
-      if(denominator<=0) { if(abs(difference)<1e-12)0 else Inf } else abs(difference)/denominator
-    }))
+    abs(additional_weighted_correlation(exposure,matrix[,j],w))
   },numeric(1))
-  data.frame(covariate=colnames(matrix),balance=values,framework=framework)
+  data.frame(covariate=colnames(matrix),balance=values,framework="IPW")
 }

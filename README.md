@@ -17,7 +17,7 @@ Author: Yang Liu. Updated: 27 October 2026.
 | [ppi_analysis.R](ppi_analysis.R) | STRING networks, modules and hub proteins |
 | [single_cell_expression.py](single_cell_expression.py) | Expression in reference heart cell types |
 | [spatial_localization.py](spatial_localization.py) | Spatial expression and paired tissue comparisons |
-| [additional_statistical_methods.R](additional_statistical_methods.R) | CB-free life expectancy, PAF, PIF and GPS/IPW |
+| [additional_statistical_methods.R](additional_statistical_methods.R) | CB-free life expectancy, PIF, weight-capped IPW and linear GPS adjustment |
 | [e_value.do](e_value.do) | E-values |
 
 ## Use
